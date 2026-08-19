@@ -2,7 +2,7 @@
 
 `radarscope.py` est un outil de rappel et de surveillance réseau locale pour macOS. Il relaie au terminal les sorties de `nmap`, `arp` et `tcpdump` au fil de l’eau.
 
-Depuis la version 2.2, RadarScope propose aussi une vue locale de l’ordinateur : métriques CPU/mémoire/disque/batterie, appareils connus par ARP, connexions TCP/UDP associées aux processus, export JSON et dashboard web sans dépendance externe.
+Depuis la version 3.0, RadarScope propose aussi une vue locale enrichie de l’ordinateur : métriques CPU/mémoire/disque/batterie, profil matériel et logiciel, machines connues par ARP avec résolution hostname multi-sources, connexions TCP/UDP associées aux processus, export JSON et dashboard web sans dépendance externe.
 
 En mode `watch`, RadarScope conserve une baseline dans `radarscope_state.json` et journalise les alertes dans `radarscope_events.jsonl`. Le même fichier conserve le cache des associations hostname/IP/MAC.
 
@@ -53,6 +53,7 @@ brew install nmap
 ./radarscope.py connections
 ./radarscope.py snapshot > radarscope_snapshot.json
 ./radarscope.py dashboard
+./radarscope.py dashboard --active-discovery
 ./radarscope.py capture --interface en0 --filter "tcp or arp" --sudo-tcpdump
 ./radarscope.py watch --target 192.168.1.0/24 --color always --sudo-tcpdump
 ./radarscope.py watch --target 192.168.1.0/24 --timing 4 --scan-interval 60 --sudo-tcpdump
@@ -61,7 +62,7 @@ brew install nmap
 ./radarscope.py watch --target 192.168.1.0/24 --display raw --sudo-tcpdump
 ```
 
-`--timing 4` accélère Nmap sur un LAN fiable. Garde `T3` sur un réseau instable, distant ou très filtré. Avec `--resolve-hostnames`, RadarScope résout les noms une seule fois, les conserve dans `radarscope_state.json` puis réutilise le cache ; les scans suivants repassent en mode numérique. Lorsqu’une adresse IP est aussi associée à une MAC par ARP, le terminal affiche une ligne `IDENTITY host=hostname (IP) mac=...`, puis réutilise durablement ce libellé dans les lignes Nmap, ARP et TCP. Un nom ne s’affiche que si un reverse DNS existe. `tcpdump` reste volontairement numérique pour conserver une détection temps réel fiable. Pour modifier les délais, utilise `--arp-interval SEC` et `--scan-interval SEC`. Pour repartir de zéro sur les noms et les associations MAC, utilise `./radarscope.py reset-hostnames`. Pour observer absolument tout le trafic, passe un filtre vide avec `--filter ""`, en sachant que le terminal peut alors être très bavard.
+`--timing 4` accélère Nmap sur un LAN fiable. Garde `T3` sur un réseau instable, distant ou très filtré. RadarScope utilise désormais `arp -a` pour récupérer les noms déjà connus par macOS, puis essaie le cache DNS système, `socket`, mDNS (`dns-sd`) et les outils `dig`/`host`/`nslookup` disponibles. Les noms trouvés sont mis en cache dans `radarscope_state.json` et associés à leur source. Le dashboard et `snapshot` activent la résolution par défaut ; passe `--no-resolve-hostnames` pour la désactiver. Lorsqu’une adresse IP est aussi associée à une MAC par ARP, le terminal affiche une ligne `IDENTITY host=hostname (IP) mac=...`, puis réutilise durablement ce libellé dans les lignes Nmap, ARP et TCP. `tcpdump` reste volontairement numérique pour conserver une détection temps réel fiable. `--active-discovery` complète l’ARP avec une découverte Nmap limitée au sous-réseau local pour obtenir fabricant, état et latence ; cette option n’est pas activée automatiquement. Pour modifier les délais, utilise `--arp-interval SEC` et `--scan-interval SEC`. Pour repartir de zéro sur les noms et les associations MAC, utilise `./radarscope.py reset-hostnames`. Pour observer absolument tout le trafic, passe un filtre vide avec `--filter ""`, en sachant que le terminal peut alors être très bavard.
 
 ## Vue locale et dashboard
 
@@ -83,14 +84,22 @@ Le dashboard ajoute :
 - la passerelle est prolongée par un globe Internet et l’IP publique observée depuis cette connexion, mise en cache quelques minutes ;
 - les noms d’hôtes connus, IP, MAC, interface et dernière observation dans la carte et la table des appareils ;
 - l’inventaire USB et Bluetooth fourni par macOS, avec repli sur l’I/O Registry quand `system_profiler` ne retourne pas les appareils ;
+- le profil matériel et logiciel de l’ordinateur local, sans numéro de série ;
+- les réseaux Wi-Fi visibles autour de l’ordinateur via le scanner natif macOS ;
+- les appareils Bluetooth proches via `blueutil` si installé, avec repli sur les appareils appairés/connus de macOS ;
+- une rubrique radio séparant le réseau Wi-Fi courant des autres réseaux, avec un bouton d’actualisation Wi-Fi/Bluetooth ;
+- les machines enrichies par hostname, source de résolution, fabricant et latence lorsque `--active-discovery` est activé ;
+- le filtrage des entrées ARP incomplètes, multicast et des réponses DNS techniques (`NXDOMAIN`, `found`, etc.) afin d’éviter la pollution de la carte ;
 - des filtres par application, port et adresse distante ;
 - des notifications macOS opt-in pour les appareils nouveaux.
 
-Pour tenter une résolution DNS inverse des appareils visibles :
+Pour activer explicitement la résolution DNS inverse des appareils visibles (elle est déjà active par défaut dans le dashboard) :
 
 ```sh
 ./radarscope.py dashboard --resolve-hostnames
 ```
+
+L’accès aux réseaux Wi-Fi peut nécessiter l’autorisation de localisation macOS. Sur les versions récentes de macOS, l’ancien utilitaire `airport` peut être absent et `system_profiler` peut renvoyer les SSID sous la forme `<redacted>` ou ne pas fournir le BSSID/RSSI ; RadarScope conserve alors les canaux, bandes et informations de sécurité disponibles et indique la source utilisée. La découverte Bluetooth des appareils réellement proches peut nécessiter l’autorisation Bluetooth et `blueutil` (`brew install blueutil`). Sans ces autorisations ou outils facultatifs, RadarScope affiche explicitement la source de repli et ne fabrique pas de données ; dans ce cas, les appareils appairés sont signalés comme tels et non comme « proches » confirmés.
 
 La courbe réseau est calculée à partir des compteurs cumulés fournis par macOS (`netstat`). Si ces compteurs sont bloqués ou absents, le dashboard l’indique explicitement et n’affiche pas de faux débit. L’IP publique est obtenue par une requête courte vers un service externe (`api.ipify.org`) et n’est jamais écrite dans l’historique SQLite. Les liens de la carte représentent une relation déduite de l’ARP et de la passerelle, pas le câblage réel d’un switch ou d’un point d’accès.
 

@@ -16,10 +16,13 @@ import shutil
 import signal
 import sqlite3
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,7 +31,7 @@ from typing import Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 
-VERSION = "2.2.0"
+VERSION = "3.0.0"
 DEFAULT_TARGET = "127.0.0.1"
 DEFAULT_PORTS = "22,80,443,631,8080"
 DEFAULT_SUSPICIOUS_PORTS = "21,23,139,445,3389,5900,6379,27017"
@@ -53,9 +56,25 @@ DEFAULT_HISTORY_HOURS = 24.0
 PUBLIC_IP_ENDPOINT = "https://api.ipify.org"
 PUBLIC_IP_CACHE_TTL = 300.0
 PUBLIC_IP_FAILURE_TTL = 30.0
+HOSTNAME_LOOKUP_TTL = 300.0
+HOSTNAME_NEGATIVE_TTL = 45.0
+HOSTNAME_LOOKUP_TIMEOUT = 1.8
+WIRELESS_SCAN_TTL = 30.0
+MACHINE_DISCOVERY_TTL = 60.0
+MACHINE_PROFILE_TTL = 300.0
 
 _public_ip_cache_lock = threading.Lock()
 _public_ip_cache: tuple[float, Optional[str]] = (0.0, None)
+_hostname_lookup_lock = threading.Lock()
+_hostname_lookup_cache: dict[str, tuple[float, Optional[str]]] = {}
+_wifi_scan_lock = threading.Lock()
+_wifi_scan_cache: tuple[float, dict[str, object]] = (0.0, {})
+_bluetooth_scan_lock = threading.Lock()
+_bluetooth_scan_cache: tuple[float, dict[str, object]] = (0.0, {})
+_machine_discovery_lock = threading.Lock()
+_machine_discovery_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
+_machine_profile_lock = threading.Lock()
+_machine_profile_cache: tuple[float, dict[str, object]] = (0.0, {})
 
 
 class Palette:
@@ -565,7 +584,40 @@ TCPDUMP_IP_RE = re.compile(
 
 
 def normalise_mac(value: str) -> str:
-    return value.strip("() ").lower()
+    candidate = value.strip("() ").lower().replace("-", ":")
+    if candidate == "incomplete":
+        return candidate
+    parts = candidate.split(":")
+    if len(parts) == 6 and all(re.fullmatch(r"[0-9a-f]{1,2}", part) for part in parts):
+        return ":".join(part.zfill(2) for part in parts)
+    compact = re.sub(r"[^0-9a-f]", "", candidate)
+    if len(compact) == 12:
+        return ":".join(compact[index : index + 2] for index in range(0, 12, 2))
+    return candidate
+
+
+def clean_hostname(value: object, address: Optional[str] = None) -> Optional[str]:
+    """Normalise un nom fourni par ARP/DNS sans confondre nom et adresse IP."""
+    candidate = str(value or "").strip().strip("() ").rstrip(".")
+    if not candidate or candidate.lower() in {
+        "?", "-", "—", "unknown", "incomplete", "nxdomain", "nx-domain", "null", "none",
+        "localhost", "found", "not", "notfound", "not-found", "noanswer", "no-answer",
+        "error", "failed", "failure",
+    }:
+        return None
+    if address and candidate == address:
+        return None
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        pass
+    else:
+        return None
+    if candidate.replace(".", "").isdigit():
+        return None
+    if any(char.isspace() for char in candidate) or len(candidate) > 253:
+        return None
+    return candidate
 
 
 def parse_arp_snapshot(lines: list[str]) -> dict[str, dict[str, str]]:
@@ -921,8 +973,11 @@ def nmap_command(
     ]
 
 
-def arp_command() -> list[str]:
-    return [command_path("arp") or "arp", "-an"]
+def arp_command(resolve_hostnames: bool = False) -> list[str]:
+    # -n est utile pour le flux temps réel, mais interdit précisément à arp de
+    # remonter les noms. Les snapshots utilisent -a puis une résolution de
+    # secours multi-méthodes.
+    return [command_path("arp") or "arp", "-a" if resolve_hostnames else "-an"]
 
 
 def persist_identity_cache(context: Context) -> None:
@@ -1327,8 +1382,8 @@ def platform_name() -> str:
     return f"{sys.platform} ({os.uname().release})" if hasattr(os, "uname") else sys.platform
 
 
-def command_output(command: list[str], timeout: float = 3.0) -> str:
-    """Retourne la sortie d'une commande locale sans interrompre le dashboard."""
+def command_result(command: list[str], timeout: float = 3.0) -> tuple[str, str, int]:
+    """Retourne stdout, stderr et code retour sans interrompre le dashboard."""
     try:
         result = subprocess.run(
             command,
@@ -1338,8 +1393,91 @@ def command_output(command: list[str], timeout: float = 3.0) -> str:
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout.strip()
+        return "", "", 127
+    return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+
+def command_output(command: list[str], timeout: float = 3.0) -> str:
+    """Retourne la sortie d'une commande locale sans interrompre le dashboard."""
+    return command_result(command, timeout)[0]
+
+
+def _hostname_from_command_output(output: str, address: str) -> Optional[str]:
+    """Extrait le premier nom exploitable des outils DNS natifs macOS."""
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        candidates = [line]
+        candidates.extend(re.findall(r"(?<![A-Za-z0-9_-])([A-Za-z0-9][A-Za-z0-9_.-]{1,252})", line))
+        for candidate in reversed(candidates):
+            candidate = candidate.split("=", 1)[-1].strip().rstrip(".")
+            if candidate.lower() in {
+                "name", "names", "pointer", "domain", "server", "servers", "address",
+                "ip_address", "nameserver", "localhost", "in-addr.arpa", "host", "nslookup",
+                "date", "timestamp", "add", "remove", "flags", "interface", "query",
+                "connection", "non-authoritative", "answer",
+            }:
+                continue
+            hostname = clean_hostname(candidate, address)
+            if hostname:
+                return hostname
+    return None
+
+
+def _reverse_dns_lookup_uncached(address: str) -> Optional[str]:
+    """Essaie successivement cache macOS, socket, mDNS et DNS classique."""
+    try:
+        name = socket.getnameinfo((address, 0), socket.NI_NAMEREQD)[0]
+    except (OSError, socket.herror, socket.gaierror):
+        name = ""
+    hostname = clean_hostname(name, address)
+    if hostname:
+        return hostname
+
+    dscacheutil = command_path("dscacheutil")
+    if dscacheutil:
+        output = command_output([dscacheutil, "-q", "host", "-a", "ip_address", address], timeout=HOSTNAME_LOOKUP_TIMEOUT)
+        hostname = _hostname_from_command_output(output, address)
+        if hostname:
+            return hostname
+
+    dns_sd = command_path("dns-sd")
+    if dns_sd:
+        output = command_output([dns_sd, "-G", "v4", address], timeout=HOSTNAME_LOOKUP_TIMEOUT)
+        hostname = _hostname_from_command_output(output, address)
+        if hostname:
+            return hostname
+
+    for tool, arguments in (
+        ("dig", ["-x", address, "+short"]),
+        ("host", [address]),
+        ("nslookup", [address]),
+    ):
+        path = command_path(tool)
+        if not path:
+            continue
+        output = command_output([path, *arguments], timeout=HOSTNAME_LOOKUP_TIMEOUT)
+        hostname = _hostname_from_command_output(output, address)
+        if hostname:
+            return hostname
+    return None
+
+
+def reverse_dns_lookup(address: str, hint: Optional[str] = None) -> tuple[Optional[str], str]:
+    """Résout une adresse avec cache positif/négatif et indique la source."""
+    hinted = clean_hostname(hint, address)
+    if hinted:
+        return hinted, "arp"
+    now = time.monotonic()
+    with _hostname_lookup_lock:
+        cached = _hostname_lookup_cache.get(address)
+        if cached and now - cached[0] < (HOSTNAME_LOOKUP_TTL if cached[1] else HOSTNAME_NEGATIVE_TTL):
+            return cached[1], "cache" if cached[1] else "none"
+    hostname = _reverse_dns_lookup_uncached(address)
+    with _hostname_lookup_lock:
+        _hostname_lookup_cache[address] = (now, hostname)
+    return hostname, "reverse-dns" if hostname else "none"
 
 
 def public_ip_address() -> Optional[str]:
@@ -1554,6 +1692,7 @@ def collect_system_snapshot() -> dict[str, object]:
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "python": platform.python_version(),
+        "hardware": collect_machine_profile(),
         "cpu": {
             "cores": os.cpu_count() or 1,
             "load": loads,
@@ -1691,7 +1830,9 @@ def default_gateway() -> Optional[str]:
 
 
 def collect_arp_entries() -> list[dict[str, object]]:
-    output = command_output([command_path("arp") or "arp", "-an"], timeout=3)
+    output = command_output(arp_command(resolve_hostnames=True), timeout=4)
+    if not output:
+        output = command_output(arp_command(), timeout=3)
     entries: dict[str, dict[str, object]] = {}
     for line in output.splitlines():
         match = ARP_LINE_RE.search(line)
@@ -1700,15 +1841,204 @@ def collect_arp_entries() -> list[dict[str, object]]:
         ip = match.group("ip").strip()
         raw_mac = normalise_mac(match.group("mac"))
         incomplete = "incomplete" in raw_mac
+        if incomplete or raw_mac == "ff:ff:ff:ff:ff:ff":
+            # macOS peut garder une entrée ARP pour chaque adresse du sous-
+            # réseau, même sans machine joignable. Ne pas lancer de résolution
+            # DNS sur ces lignes : elles ne représentent pas une machine.
+            continue
         host_prefix = line.split(" (", 1)[0].strip()
+        hostname = clean_hostname(host_prefix, ip)
         entries[ip] = {
             "ip": ip,
-            "hostname": None if host_prefix in {"", "?"} else host_prefix,
-            "mac": None if incomplete else raw_mac,
+            "hostname": hostname,
+            "hostname_source": "arp" if hostname else None,
+            "mac": raw_mac,
             "interface": match.group("interface"),
             "reachable": not incomplete,
+            "source": ["arp"],
         }
     return sorted(entries.values(), key=lambda item: str(item["ip"]))
+
+
+def netmask_to_prefix(value: str) -> Optional[int]:
+    candidate = value.strip()
+    try:
+        if candidate.lower().startswith("0x"):
+            mask = int(candidate, 16)
+            packed = struct.pack(">I", mask)
+            network = ipaddress.IPv4Network(f"0.0.0.0/{ipaddress.IPv4Address(packed)}")
+            return network.prefixlen
+        return ipaddress.IPv4Network(f"0.0.0.0/{candidate}").prefixlen
+    except (ValueError, OSError):
+        return None
+
+
+def local_network_cidr(interface: str) -> Optional[str]:
+    """Déduit le réseau IPv4 local sans scanner une interface inconnue."""
+    address = interface_ipv4(interface)
+    if not address:
+        return None
+    ifconfig = command_path("ifconfig")
+    if not ifconfig:
+        return None
+    output = command_output([ifconfig, interface], timeout=2)
+    match = re.search(r"\bnetmask\s+(0x[0-9a-fA-F]+|\d{1,3}(?:\.\d{1,3}){3})", output)
+    prefix = netmask_to_prefix(match.group(1)) if match else None
+    if prefix is None:
+        return None
+    try:
+        return str(ipaddress.ip_network(f"{address}/{prefix}", strict=False))
+    except ValueError:
+        return None
+
+
+def parse_nmap_discovery_xml(output: str) -> list[dict[str, object]]:
+    """Extrait les informations d'hôtes de la sortie XML de nmap -sn."""
+    if not output.strip():
+        return []
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        return []
+    records: list[dict[str, object]] = []
+    for host in root.findall("host"):
+        status = host.find("status")
+        state = status.get("state") if status is not None else None
+        ipv4 = None
+        mac = None
+        vendor = None
+        for address in host.findall("address"):
+            address_type = address.get("addrtype")
+            if address_type == "ipv4":
+                ipv4 = address.get("addr")
+            elif address_type == "mac":
+                mac = normalise_mac(address.get("addr", "")) or None
+                vendor = address.get("vendor") or None
+        if not ipv4:
+            continue
+        raw_hostnames = [name.get("name", "").rstrip(".") for name in host.findall("hostnames/hostname")]
+        hostnames = [hostname for hostname in (clean_hostname(name, ipv4) for name in raw_hostnames) if hostname]
+        invalid_hostname = any(name.lower() in {"nxdomain", "nx-domain"} for name in raw_hostnames)
+        # Nmap peut retourner un rapport PTR « NXDOMAIN » pour une adresse qui
+        # n'est pas une machine exploitable. Sans MAC, ce résultat pollue la
+        # carte avec toute une plage d'adresses fictivement nommées.
+        if invalid_hostname and not mac:
+            continue
+        times = host.find("times")
+        latency_ms = None
+        if times is not None and times.get("srtt"):
+            try:
+                latency_ms = round(int(times.get("srtt", "0")) / 1000, 2)
+            except ValueError:
+                latency_ms = None
+        records.append(
+            {
+                "ip": ipv4,
+                "hostname": hostnames[0] if hostnames else None,
+                "hostname_source": "nmap" if hostnames else None,
+                "hostname_error": "NXDOMAIN" if invalid_hostname else None,
+                "mac": mac,
+                "vendor": vendor,
+                "nmap_state": state,
+                "latency_ms": latency_ms,
+                "reachable": state == "up",
+                "source": ["nmap"],
+            }
+        )
+    return records
+
+
+def machine_is_displayable(device: dict[str, object]) -> bool:
+    """Évite d'afficher dans la carte les entrées ARP/Nmap sans identité fiable."""
+    ip_value = str(device.get("ip") or "")
+    try:
+        address = ipaddress.ip_address(ip_value)
+    except ValueError:
+        return False
+    if address.is_loopback or address.is_multicast or address.is_unspecified or address.is_reserved:
+        return False
+    hostname = clean_hostname(device.get("hostname"), str(device.get("ip") or ""))
+    mac = normalise_mac(str(device.get("mac") or ""))
+    if str(device.get("hostname_error") or "").upper() == "NXDOMAIN" and not mac:
+        return False
+    if hostname:
+        return True
+    if mac and mac not in {"incomplete", "ff:ff:ff:ff:ff:ff"}:
+        return True
+    sources = device.get("source", [])
+    if isinstance(sources, str):
+        sources = [sources]
+    return bool(
+        device.get("nmap_state") == "up"
+        and device.get("latency_ms") is not None
+        and "nmap" in sources
+    )
+
+
+def machine_discovery_command(target: str) -> list[str]:
+    nmap = command_path("nmap") or "nmap"
+    return [
+        nmap,
+        "-sn",
+        "-PR",
+        "-R",
+        "--system-dns",
+        "--reason",
+        "--max-retries",
+        "1",
+        "--host-timeout",
+        "5s",
+        "-T3",
+        "-oX",
+        "-",
+        target,
+    ]
+
+
+def active_machine_discovery(target: Optional[str]) -> list[dict[str, object]]:
+    """Découverte active optionnelle, limitée au réseau local déduit par macOS."""
+    if not target or not command_path("nmap"):
+        return []
+    now = time.monotonic()
+    with _machine_discovery_lock:
+        cached = _machine_discovery_cache.get(target)
+        if cached and now - cached[0] < MACHINE_DISCOVERY_TTL:
+            return [dict(record) for record in cached[1]]
+    output = command_output(machine_discovery_command(target), timeout=35)
+    records = parse_nmap_discovery_xml(output)
+    with _machine_discovery_lock:
+        _machine_discovery_cache[target] = (now, records)
+    return [dict(record) for record in records]
+
+
+def merge_machine_records(
+    passive: list[dict[str, object]],
+    active: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Fusionne ARP, reverse DNS et nmap en conservant la provenance des champs."""
+    merged: dict[str, dict[str, object]] = {}
+    for record in passive + active:
+        ip = str(record.get("ip") or "").strip()
+        if not ip:
+            continue
+        current = merged.setdefault(ip, {"ip": ip, "source": []})
+        sources = current.setdefault("source", [])
+        if not isinstance(sources, list):
+            sources = []
+            current["source"] = sources
+        for source in record.get("source", []):
+            if source not in sources:
+                sources.append(source)
+        for key, value in record.items():
+            if key == "source" or value in (None, "", [], {}):
+                continue
+            if key == "reachable":
+                current[key] = bool(current.get(key)) or bool(value)
+            else:
+                current[key] = value
+    for record in merged.values():
+        record["source"] = sorted(record.get("source", []))
+    return sorted(merged.values(), key=lambda item: str(item.get("ip", "")))
 
 
 def parse_lsof_connections(output: str) -> list[dict[str, object]]:
@@ -1758,6 +2088,375 @@ def system_profiler_json(data_type: str) -> object:
         return json.loads(output)
     except json.JSONDecodeError:
         return {}
+
+
+def profiler_records(data_type: str) -> list[dict[str, object]]:
+    value = system_profiler_json(data_type)
+    if isinstance(value, dict):
+        records = value.get(data_type, [])
+        if isinstance(records, list):
+            return [record for record in records if isinstance(record, dict)]
+    return []
+
+
+def collect_machine_profile() -> dict[str, object]:
+    """Collecte le maximum d'informations locales non sensibles sur cet ordinateur."""
+    global _machine_profile_cache
+    now = time.monotonic()
+    with _machine_profile_lock:
+        if now - _machine_profile_cache[0] < MACHINE_PROFILE_TTL and _machine_profile_cache[1]:
+            return dict(_machine_profile_cache[1])
+    hardware = profiler_records("SPHardwareDataType")
+    software = profiler_records("SPSoftwareDataType")
+    hardware_record = hardware[0] if hardware else {}
+    software_record = software[0] if software else {}
+    physical_memory = parse_human_bytes(str(hardware_record.get("physical_memory", "")))
+    profile = {
+        "model": hardware_record.get("machine_model_name") or hardware_record.get("machine_name"),
+        "model_identifier": hardware_record.get("machine_model"),
+        "chip": hardware_record.get("chip") or hardware_record.get("cpu_type"),
+        "processor_count": hardware_record.get("number_processors") or hardware_record.get("number_processors_active"),
+        "memory_bytes": physical_memory,
+        "architecture": platform.machine(),
+        "os_version": software_record.get("os_version") or platform.platform(),
+        "kernel": software_record.get("kernel_version") or platform.release(),
+        "computer_name": software_record.get("local_host_name") or software_record.get("computer_name"),
+    }
+    with _machine_profile_lock:
+        _machine_profile_cache = (now, profile)
+    return dict(profile)
+
+
+def airport_command() -> Optional[list[str]]:
+    candidates = [
+        command_path("airport"),
+        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return [candidate, "-s"]
+    return None
+
+
+def wifi_interface_name() -> Optional[str]:
+    for device, port in hardware_port_map().items():
+        if "wi-fi" in port.lower() or "wifi" in port.lower() or "airport" in port.lower():
+            return device
+    return None
+
+
+def current_wifi_ssid(interface: Optional[str] = None) -> Optional[str]:
+    networksetup = command_path("networksetup")
+    interface = interface or wifi_interface_name()
+    if not networksetup or not interface:
+        return None
+    output = command_output([networksetup, "-getairportnetwork", interface], timeout=3)
+    match = re.search(r"Current Wi-?Fi Network:\s*(.+)$", output, re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    return candidate if candidate and "not associated" not in candidate.lower() else None
+
+
+def mark_current_wifi(networks: list[dict[str, object]], current_ssid: Optional[str]) -> list[dict[str, object]]:
+    return [
+        {
+            **network,
+            "current": bool(network.get("current") or (current_ssid and str(network.get("ssid")) == current_ssid)),
+        }
+        for network in networks
+    ]
+
+
+def wifi_band(channel: object) -> Optional[str]:
+    match = re.match(r"\s*(\d+)", str(channel or ""))
+    if not match:
+        return None
+    number = int(match.group(1))
+    if number <= 14:
+        return "2.4 GHz"
+    if number >= 180:
+        return "6 GHz"
+    return "5 GHz"
+
+
+def parse_airport_scan(output: str) -> list[dict[str, object]]:
+    """Parse la sortie alignée de `airport -s`, y compris les SSID avec espaces."""
+    pattern = re.compile(
+        r"^(?P<ssid>.*?)\s+(?P<bssid>(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})"
+        r"\s+(?P<rssi>-?\d+)\s+(?P<channel>[0-9]+(?:,[0-9]+)?(?:\s*\([^)]*\))?)"
+        r"\s+(?P<ht>\S+)\s+(?P<cc>\S+)\s+(?P<security>.+?)\s*$"
+    )
+    networks: list[dict[str, object]] = []
+    for line in output.splitlines():
+        match = pattern.match(line.rstrip())
+        if not match:
+            continue
+        ssid = match.group("ssid").strip() or "<réseau masqué>"
+        channel = match.group("channel").strip()
+        security = match.group("security").strip()
+        networks.append(
+            {
+                "ssid": ssid,
+                "bssid": match.group("bssid").lower(),
+                "rssi_dbm": int(match.group("rssi")),
+                "channel": channel,
+                "band": wifi_band(channel),
+                "security": security or "ouverte",
+                "ht": match.group("ht"),
+                "country": match.group("cc"),
+                "source": "airport",
+            }
+        )
+    unique = {(str(item["bssid"]), str(item["ssid"])): item for item in networks}
+    return sorted(unique.values(), key=lambda item: int(item["rssi_dbm"]), reverse=True)
+
+
+def parse_profiler_wifi(value: object) -> list[dict[str, object]]:
+    """Récupère le réseau courant lorsque le scan airport est indisponible."""
+    records: list[dict[str, object]] = []
+
+    def visit(node: object, current_hint: bool = False) -> None:
+        if isinstance(node, dict):
+            ssid = node.get("_name") or node.get("SSID") or node.get("spairport_network_name")
+            bssid = node.get("BSSID") or node.get("spairport_bssid")
+            is_current = current_hint or (node.get("spairport_current_network_information") is not None and "spairport_network_channel" in node)
+            is_network = bool(bssid or "spairport_network_channel" in node)
+            if ssid and is_network:
+                channel = node.get("channel") or node.get("spairport_channel") or node.get("spairport_network_channel")
+                records.append(
+                    {
+                        "ssid": str(ssid),
+                        "bssid": str(bssid or "—").lower(),
+                        "rssi_dbm": node.get("RSSI") or node.get("spairport_signal_strength"),
+                        "channel": channel,
+                        "band": wifi_band(channel),
+                        "security": node.get("security") or node.get("spairport_security_mode") or "inconnue",
+                        "current": is_current,
+                        "source": "system_profiler",
+                    }
+                )
+            for key, child in node.items():
+                visit(child, current_hint or key == "spairport_current_network_information")
+        elif isinstance(node, list):
+            for child in node:
+                visit(child, current_hint)
+
+    visit(value)
+    unique: dict[tuple[str, ...], dict[str, object]] = {}
+    for item in records:
+        bssid = str(item["bssid"])
+        if bssid in {"", "—", "-"}:
+            key = (str(item["ssid"]), bssid, str(item.get("channel") or ""), str(item.get("security") or ""))
+        else:
+            key = (str(item["ssid"]), bssid)
+        unique[key] = item
+    return sorted(unique.values(), key=lambda item: str(item["ssid"]))
+
+
+def collect_wifi_networks(force_refresh: bool = False) -> dict[str, object]:
+    """Scanne les réseaux Wi-Fi voisins avec le scanner natif de macOS."""
+    global _wifi_scan_cache
+    now = time.monotonic()
+    with _wifi_scan_lock:
+        if not force_refresh and now - _wifi_scan_cache[0] < WIRELESS_SCAN_TTL and _wifi_scan_cache[1]:
+            cached = _wifi_scan_cache[1]
+            return {**cached, "networks": [dict(item) for item in cached.get("networks", [])]}
+        command = airport_command()
+        if command:
+            output, error, return_code = command_result(command, timeout=12)
+            networks = parse_airport_scan(output)
+            if networks:
+                interface = wifi_interface_name()
+                current_ssid = current_wifi_ssid(interface)
+                networks = mark_current_wifi(networks, current_ssid)
+                payload = {
+                    "available": True,
+                    "interface": interface,
+                    "current_ssid": current_ssid,
+                    "other_network_count": sum(1 for network in networks if not network.get("current")),
+                    "source": "airport",
+                    "networks": networks,
+                    "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "error": None,
+                }
+                _wifi_scan_cache = (now, payload)
+                return {**payload, "networks": [dict(item) for item in networks]}
+            reason = error or (f"airport a retourné le code {return_code}" if return_code else "aucun réseau visible")
+        else:
+            reason = "scanner Wi-Fi natif indisponible"
+        interface = wifi_interface_name()
+        current_ssid = current_wifi_ssid(interface)
+        fallback = mark_current_wifi(parse_profiler_wifi(system_profiler_json("SPAirPortDataType")), current_ssid)
+        payload = {
+            "available": bool(fallback),
+            "interface": interface,
+            "current_ssid": current_ssid,
+            "other_network_count": sum(1 for network in fallback if not network.get("current")),
+            "source": "system_profiler" if fallback else None,
+            "networks": fallback,
+            "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "error": None if fallback else reason,
+        }
+        _wifi_scan_cache = (now, payload)
+        return {**payload, "networks": [dict(item) for item in fallback]}
+
+
+def bluetooth_address(value: object) -> Optional[str]:
+    candidate = str(value or "").strip().lower().replace("-", ":")
+    return candidate if re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", candidate) else None
+
+
+def as_bool(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "attrib_false"}
+    return bool(value)
+
+
+def parse_blueutil_inquiry(output: str) -> list[dict[str, object]]:
+    """Parse le JSON de blueutil, avec repli texte pour plusieurs versions."""
+    try:
+        decoded = json.loads(output)
+    except json.JSONDecodeError:
+        decoded = None
+    values = decoded.get("devices", []) if isinstance(decoded, dict) else decoded
+    if not isinstance(values, list):
+        values = []
+    records: list[dict[str, object]] = []
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        address = bluetooth_address(item.get("address") or item.get("mac") or item.get("bd_addr"))
+        name = item.get("name") or item.get("title") or item.get("device_name")
+        if not address:
+            continue
+        records.append(
+            {
+                "name": str(name or "Appareil Bluetooth"),
+                "address": address,
+                "rssi_dbm": item.get("rssi") or item.get("RSSI"),
+                "connected": as_bool(item.get("connected", False)),
+                "paired": as_bool(item.get("paired", False)),
+                "nearby": True,
+                "source": "blueutil",
+                "device_class": item.get("class") or item.get("device_class"),
+            }
+        )
+    if records:
+        return records
+    for line in output.splitlines():
+        address_match = re.search(r"(?P<address>(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})", line)
+        if not address_match:
+            continue
+        address = bluetooth_address(address_match.group("address"))
+        if not address:
+            continue
+        name = line[: address_match.start()].strip(" :\t") or "Appareil Bluetooth"
+        rssi_match = re.search(r"(?:rssi|RSSI)\s*[:=]\s*(-?\d+)", line)
+        records.append(
+            {
+                "name": name,
+                "address": address,
+                "rssi_dbm": int(rssi_match.group(1)) if rssi_match else None,
+                "connected": False,
+                "paired": False,
+                "nearby": True,
+                "source": "blueutil",
+            }
+        )
+    return records
+
+
+def parse_profiler_bluetooth(value: object) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, dict):
+            address = bluetooth_address(
+                node.get("device_address") or node.get("address") or node.get("device_bd_addr")
+            )
+            name = node.get("device_name") or node.get("_name") or node.get("name")
+            if address and name and str(name) != "Bluetooth-Incoming-Port":
+                records.append(
+                    {
+                        "name": str(name),
+                        "address": address,
+                        "rssi_dbm": node.get("device_rssi") or node.get("RSSI"),
+                        "connected": as_bool(node.get("device_is_connected") or node.get("device_connected")),
+                        "paired": True,
+                        "nearby": False,
+                        "source": "system_profiler",
+                        "device_class": node.get("device_class") or node.get("device_type"),
+                    }
+                )
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return records
+
+
+def collect_bluetooth_devices(force_refresh: bool = False) -> dict[str, object]:
+    """Découvre les appareils Bluetooth proches, puis complète avec les appareils appairés."""
+    global _bluetooth_scan_cache
+    now = time.monotonic()
+    with _bluetooth_scan_lock:
+        if not force_refresh and now - _bluetooth_scan_cache[0] < WIRELESS_SCAN_TTL and _bluetooth_scan_cache[1]:
+            cached = _bluetooth_scan_cache[1]
+            return {
+                **cached,
+                "devices": [dict(item) for item in cached.get("devices", [])],
+                "nearby_devices": [dict(item) for item in cached.get("nearby_devices", [])],
+            }
+        records: list[dict[str, object]] = []
+        error: Optional[str] = None
+        blueutil = command_path("blueutil")
+        if blueutil:
+            output, stderr, return_code = command_result(
+                [blueutil, "--inquiry", "--format", "json", "--timeout", "5"], timeout=12
+            )
+            records.extend(parse_blueutil_inquiry(output))
+            if not records:
+                error = stderr or (f"blueutil a retourné le code {return_code}" if return_code else "aucun appareil proche")
+        if not records:
+            records.extend(parse_profiler_bluetooth(system_profiler_json("SPBluetoothDataType")))
+        if not records:
+            records.extend(
+                {
+                    **record,
+                    "nearby": False,
+                    "source": "ioreg",
+                }
+                for record in collect_ioreg_peripherals("Bluetooth")
+                if record.get("address")
+            )
+        unique: dict[str, dict[str, object]] = {}
+        for record in records:
+            address = bluetooth_address(record.get("address")) or str(record.get("name") or "")
+            if not address:
+                continue
+            existing = unique.get(address, {})
+            merged = {**existing, **record}
+            if existing.get("nearby"):
+                merged["nearby"] = True
+            unique[address] = merged
+        devices = sorted(unique.values(), key=lambda item: (not bool(item.get("nearby")), str(item.get("name", ""))))
+        nearby_devices = [dict(device) for device in devices if device.get("nearby")]
+        nearby_scan_available = bool(nearby_devices and any(device.get("source") == "blueutil" for device in nearby_devices))
+        payload = {
+            "available": bool(devices),
+            "source": "blueutil" if blueutil and any(item.get("source") == "blueutil" for item in devices) else "system_profiler" if devices else None,
+            "devices": devices,
+            "nearby_devices": nearby_devices,
+            "nearby_scan_available": nearby_scan_available,
+            "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "error": None if devices else error or "aucun appareil Bluetooth détecté ou autorisation manquante",
+        }
+        _bluetooth_scan_cache = (now, payload)
+        return {**payload, "devices": [dict(item) for item in devices]}
 
 
 def ioreg_value(raw: str) -> object:
@@ -1895,14 +2594,28 @@ def peripheral_records(value: object, kind: str, records: list[dict[str, object]
             peripheral_records(child, kind, records)
 
 
-def collect_peripherals() -> list[dict[str, object]]:
+def collect_peripherals(bluetooth_snapshot: Optional[dict[str, object]] = None) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     peripheral_records(system_profiler_json("SPUSBDataType"), "USB", records)
-    peripheral_records(system_profiler_json("SPBluetoothDataType"), "Bluetooth", records)
     if not any(record.get("kind") == "USB" for record in records):
         records.extend(collect_ioreg_peripherals("USB"))
-    if not any(record.get("kind") == "Bluetooth" for record in records):
-        records.extend(collect_ioreg_peripherals("Bluetooth"))
+    bluetooth_snapshot = bluetooth_snapshot or collect_bluetooth_devices()
+    bluetooth_devices = bluetooth_snapshot.get("devices", []) if isinstance(bluetooth_snapshot, dict) else []
+    for device in bluetooth_devices:
+        if not isinstance(device, dict):
+            continue
+        records.append(
+            {
+                "kind": "Bluetooth",
+                "name": device.get("name") or "Appareil Bluetooth",
+                "manufacturer": device.get("manufacturer"),
+                "transport": "Bluetooth",
+                "address": device.get("address"),
+                "rssi_dbm": device.get("rssi_dbm"),
+                "nearby": device.get("nearby", False),
+                "connected": device.get("connected", False),
+            }
+        )
     unique: dict[tuple[str, str, str], dict[str, object]] = {}
     for record in records:
         key = (str(record["kind"]), str(record["name"]), str(record.get("address") or ""))
@@ -1972,7 +2685,8 @@ def build_topology(
     visible_devices = [
         device
         for device in devices
-        if selected_interface in (None, "", "all") or device.get("interface") == selected_interface
+        if machine_is_displayable(device)
+        and (selected_interface in (None, "", "all") or device.get("interface") == selected_interface)
     ]
     for device in visible_devices:
         ip = str(device.get("ip") or "")
@@ -1993,8 +2707,13 @@ def build_topology(
                 "kind": "device",
                 "ip": ip,
                 "mac": device.get("mac"),
+                "vendor": device.get("vendor"),
                 "hostname": device.get("hostname"),
+                "hostname_source": device.get("hostname_source"),
                 "interface": device.get("interface"),
+                "source": device.get("source"),
+                "latency_ms": device.get("latency_ms"),
+                "nmap_state": device.get("nmap_state"),
                 "reachable": device.get("reachable"),
                 "stale": device.get("stale", False),
                 "last_seen": device.get("last_seen"),
@@ -2073,24 +2792,74 @@ def read_cached_hostnames(filename: str) -> dict[str, str]:
     } if isinstance(hostnames, dict) else {}
 
 
+def persist_discovered_hostnames(filename: str, discovered: dict[str, str]) -> None:
+    """Ajoute les noms trouvés au cache existant sans effacer les identités."""
+    if not discovered or filename.lower() in ("", "none", "-", "off"):
+        return
+    try:
+        state = StateStore(filename)
+        hostnames = state.data.setdefault("hostnames", {})
+        if not isinstance(hostnames, dict):
+            hostnames = {}
+            state.data["hostnames"] = hostnames
+        changed = False
+        for address, hostname in discovered.items():
+            if hostnames.get(address) != hostname:
+                hostnames[address] = hostname
+                changed = True
+        if not changed:
+            return
+        identities = state.data.setdefault("identities", {})
+        if not isinstance(identities, dict):
+            identities = {}
+            state.data["identities"] = identities
+        for address, hostname in discovered.items():
+            identity = identities.setdefault(address, {})
+            if isinstance(identity, dict):
+                identity["hostname"] = hostname
+        state.save()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return
+
+
 def enrich_device_identities(
     devices: list[dict[str, object]],
     state_file: str,
-    resolve_hostnames: bool = False,
+    resolve_hostnames: bool = True,
 ) -> list[dict[str, object]]:
     cached = read_cached_hostnames(state_file)
+    to_resolve: list[tuple[dict[str, object], str]] = []
     for device in devices:
         ip = str(device.get("ip") or "")
-        hostname = str(device.get("hostname") or "").strip()
-        if not hostname or hostname == "?":
-            hostname = cached.get(ip, "")
-        if not hostname and resolve_hostnames and ip:
-            try:
-                hostname = socket.gethostbyaddr(ip)[0]
-            except (OSError, socket.herror, socket.gaierror):
-                hostname = ""
-        device["hostname"] = hostname or None
+        hostname = clean_hostname(device.get("hostname"), ip) or clean_hostname(cached.get(ip), ip)
+        if hostname:
+            device["hostname"] = hostname
+            device["hostname_source"] = device.get("hostname_source") or "state"
+        elif resolve_hostnames and ip:
+            to_resolve.append((device, ip))
+        else:
+            device["hostname"] = None
         device["last_seen"] = time.strftime("%H:%M:%S")
+
+    discovered: dict[str, str] = {}
+    if to_resolve:
+        workers = min(8, len(to_resolve))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="radarscope-dns") as executor:
+            futures = {
+                executor.submit(reverse_dns_lookup, ip, device.get("hostname")): (device, ip)
+                for device, ip in to_resolve
+            }
+            for future in as_completed(futures):
+                device, ip = futures[future]
+                try:
+                    hostname, source = future.result()
+                except (OSError, ValueError, socket.error):
+                    hostname, source = None, "none"
+                device["hostname"] = hostname
+                device["hostname_source"] = source if hostname else None
+                if hostname:
+                    discovered[ip] = hostname
+    persist_discovered_hostnames(state_file, discovered)
     return devices
 
 
@@ -2137,7 +2906,11 @@ class HistoryStore:
                 ip TEXT,
                 mac TEXT,
                 hostname TEXT,
-                interface TEXT
+                interface TEXT,
+                vendor TEXT,
+                hostname_source TEXT,
+                source TEXT,
+                latency_ms REAL
             );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -2145,6 +2918,18 @@ class HistoryStore:
             );
             """
         )
+        existing_columns = {
+            str(row[1])
+            for row in self.connection.execute("PRAGMA table_info(devices)").fetchall()
+        }
+        for column, definition in (
+            ("vendor", "TEXT"),
+            ("hostname_source", "TEXT"),
+            ("source", "TEXT"),
+            ("latency_ms", "REAL"),
+        ):
+            if column not in existing_columns:
+                self.connection.execute(f"ALTER TABLE devices ADD COLUMN {column} {definition}")
         self.connection.commit()
 
     @property
@@ -2229,14 +3014,21 @@ class HistoryStore:
                         new_devices.append(device)
                     self.connection.execute(
                         """
-                        INSERT INTO devices(device_key, first_seen, last_seen, ip, mac, hostname, interface)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO devices(
+                            device_key, first_seen, last_seen, ip, mac, hostname, interface,
+                            vendor, hostname_source, source, latency_ms
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(device_key) DO UPDATE SET
                             last_seen = excluded.last_seen,
                             ip = excluded.ip,
                             mac = excluded.mac,
                             hostname = excluded.hostname,
-                            interface = excluded.interface
+                            interface = excluded.interface,
+                            vendor = excluded.vendor,
+                            hostname_source = excluded.hostname_source,
+                            source = excluded.source,
+                            latency_ms = excluded.latency_ms
                         """,
                         (
                             key,
@@ -2246,6 +3038,10 @@ class HistoryStore:
                             device.get("mac"),
                             device.get("hostname"),
                             device.get("interface"),
+                            device.get("vendor"),
+                            device.get("hostname_source"),
+                            ",".join(device.get("source", [])) if isinstance(device.get("source"), list) else device.get("source"),
+                            device.get("latency_ms"),
                         ),
                     )
             if not baseline_initialized:
@@ -2302,7 +3098,7 @@ class HistoryStore:
         with self.lock:
             rows = self.connection.execute(
                 """
-                SELECT ip, mac, hostname, interface, last_seen
+                SELECT ip, mac, hostname, interface, vendor, hostname_source, source, latency_ms, last_seen
                 FROM devices
                 WHERE last_seen >= ?
                 ORDER BY last_seen DESC
@@ -2316,9 +3112,13 @@ class HistoryStore:
                 "mac": row[1],
                 "hostname": row[2],
                 "interface": row[3],
+                "vendor": row[4],
+                "hostname_source": row[5],
+                "source": row[6].split(",") if row[6] else [],
+                "latency_ms": row[7],
                 "reachable": False,
                 "stale": True,
-                "last_seen": time.strftime("%H:%M:%S", time.localtime(row[4])),
+                "last_seen": time.strftime("%H:%M:%S", time.localtime(row[8])),
             }
             for row in rows
         ]
@@ -2376,6 +3176,7 @@ class DashboardRuntime:
         history_hours: float,
         notify_new_devices: bool,
         resolve_hostnames: bool,
+        active_discovery: bool,
     ) -> None:
         self.state_file = state_file
         self.event_log = event_log
@@ -2384,13 +3185,14 @@ class DashboardRuntime:
         self.history_hours = history_hours
         self.notify_new_devices = notify_new_devices
         self.resolve_hostnames = resolve_hostnames
+        self.active_discovery = active_discovery
         self.stop = threading.Event()
         self.snapshot_lock = threading.RLock()
         self.sample_lock = threading.Lock()
         self.latest: Optional[dict[str, object]] = None
         self.thread: Optional[threading.Thread] = None
 
-    def sample_once(self) -> dict[str, object]:
+    def sample_once(self, refresh_wireless: bool = False) -> dict[str, object]:
         with self.sample_lock:
             snapshot = collect_snapshot(
                 self.state_file,
@@ -2398,6 +3200,8 @@ class DashboardRuntime:
                 include_peripherals=True,
                 include_topology=True,
                 resolve_hostnames=self.resolve_hostnames,
+                active_discovery=self.active_discovery,
+                refresh_wireless=refresh_wireless,
             )
             new_devices = self.history.record_snapshot(snapshot, self.history_hours)
             for device in new_devices:
@@ -2428,8 +3232,8 @@ class DashboardRuntime:
             snapshot = self.latest
         return snapshot if snapshot is not None else self.sample_once()
 
-    def response(self, interface: Optional[str] = None) -> dict[str, object]:
-        payload = dict(self.current())
+    def response(self, interface: Optional[str] = None, refresh_wireless: bool = False) -> dict[str, object]:
+        payload = dict(self.sample_once(refresh_wireless=True)) if refresh_wireless else dict(self.current())
         system = payload.get("system", {})
         interface_rows = system.get("interfaces", []) if isinstance(system, dict) else []
         valid_interfaces = {
@@ -2455,7 +3259,10 @@ class DashboardRuntime:
                 current_device.setdefault("stale", False)
                 merged_devices.append(current_device)
             payload["devices"] = [
-                device for device in merged_devices if selected == "all" or device.get("interface") == selected
+                device
+                for device in merged_devices
+                if machine_is_displayable(device)
+                and (selected == "all" or device.get("interface") == selected)
             ]
         payload["network"] = select_network_counters(payload.get("network", {}), selected)
         if isinstance(system, dict):
@@ -2479,10 +3286,22 @@ def collect_snapshot(
     event_log: str = DEFAULT_EVENT_LOG,
     include_peripherals: bool = False,
     include_topology: bool = False,
-    resolve_hostnames: bool = False,
+    resolve_hostnames: bool = True,
+    active_discovery: bool = False,
+    refresh_wireless: bool = False,
 ) -> dict[str, object]:
     system = collect_system_snapshot()
-    devices = enrich_device_identities(collect_arp_entries(), state_file, resolve_hostnames)
+    passive_devices = collect_arp_entries()
+    active_devices = []
+    if active_discovery and isinstance(system, dict):
+        active_devices = active_machine_discovery(
+            local_network_cidr(str(system.get("default_interface") or ""))
+        )
+    devices = enrich_device_identities(
+        merge_machine_records(passive_devices, active_devices),
+        state_file,
+        resolve_hostnames,
+    )
     snapshot: dict[str, object] = {
         "version": VERSION,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -2494,7 +3313,11 @@ def collect_snapshot(
         "events": read_recent_events(event_log),
     }
     if include_peripherals:
-        snapshot["peripherals"] = collect_peripherals()
+        wifi = collect_wifi_networks(force_refresh=refresh_wireless)
+        bluetooth = collect_bluetooth_devices(force_refresh=refresh_wireless)
+        snapshot["wifi"] = wifi
+        snapshot["bluetooth"] = bluetooth
+        snapshot["peripherals"] = collect_peripherals(bluetooth)
     if include_topology:
         snapshot["topology"] = build_topology(devices, system)
     return snapshot
@@ -2524,7 +3347,12 @@ def format_duration(seconds: object) -> str:
 
 
 def run_status(_context: Context, args: argparse.Namespace) -> int:
-    snapshot = collect_snapshot(args.state_file, args.event_log)
+    snapshot = collect_snapshot(
+        args.state_file,
+        args.event_log,
+        resolve_hostnames=args.resolve_hostnames,
+        active_discovery=args.active_discovery,
+    )
     system = snapshot["system"]
     cpu = system["cpu"]
     memory = system["memory"]
@@ -2538,23 +3366,36 @@ def run_status(_context: Context, args: argparse.Namespace) -> int:
     print(f"Batterie   : {battery.get('percent', 'n/d')}% — {battery.get('status', 'n/d')}")
     print(f"Uptime     : {format_duration(system['uptime_seconds'])}")
     print(f"Réseau     : {system['default_interface']} — {len(snapshot['devices'])} appareil(s), {len(snapshot['connections'])} connexion(s)")
+    hardware = system.get("hardware", {})
+    if isinstance(hardware, dict):
+        print(f"Machine    : {hardware.get('model') or hardware.get('chip') or 'n/d'}")
     return 0
 
 
-def run_devices(_context: Context, _args: argparse.Namespace) -> int:
-    devices = collect_arp_entries()
+def run_devices(_context: Context, args: argparse.Namespace) -> int:
+    passive = collect_arp_entries()
+    active: list[dict[str, object]] = []
+    if args.active_discovery:
+        system = collect_system_snapshot()
+        active = active_machine_discovery(local_network_cidr(str(system.get("default_interface") or "")))
+    devices = enrich_device_identities(
+        merge_machine_records(passive, active),
+        args.state_file,
+        args.resolve_hostnames,
+    )
     if not devices:
         print("Aucun appareil présent dans la table ARP.")
         return 0
-    print("IP                 MAC               Interface   État       Nom")
-    print("-" * 78)
+    print("IP                 MAC               Interface   État       Nom                         Source")
+    print("-" * 108)
     for device in devices:
         print(
             f"{str(device['ip']):<18} "
             f"{str(device['mac'] or '-'): <17} "
             f"{str(device['interface']):<11} "
             f"{'actif' if device['reachable'] else 'incomplet':<10} "
-            f"{device['hostname'] or '-'}"
+            f"{str(device['hostname'] or '-'):<28} "
+            f"{','.join(device.get('source', [])) if isinstance(device.get('source'), list) else '-'}"
         )
     return 0
 
@@ -2578,7 +3419,14 @@ def run_connections(_context: Context, _args: argparse.Namespace) -> int:
 def run_snapshot(_context: Context, args: argparse.Namespace) -> int:
     print(
         json.dumps(
-            collect_snapshot(args.state_file, args.event_log, include_peripherals=True, include_topology=True),
+            collect_snapshot(
+                args.state_file,
+                args.event_log,
+                include_peripherals=True,
+                include_topology=True,
+                resolve_hostnames=args.resolve_hostnames,
+                active_discovery=args.active_discovery,
+            ),
             ensure_ascii=False,
             indent=2,
         )
@@ -2600,7 +3448,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     header { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:22px; }
     h1 { margin:0 0 5px; font-size:28px; letter-spacing:.02em; } h2 { margin:0 0 14px; font-size:16px; } p { margin:0; color:var(--muted); }
     .badge { border:1px solid #2a5972; color:var(--cyan); border-radius:999px; padding:7px 11px; white-space:nowrap; }
-    .grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:16px; }
+    .grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:12px; margin-bottom:16px; }
     .card,.panel { background:rgba(16,29,46,.92); border:1px solid var(--line); border-radius:14px; box-shadow:0 14px 32px rgba(0,0,0,.16); }
     .card { padding:16px; min-height:104px; } .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; } .value { margin-top:8px; font-size:22px; font-weight:700; }
     .sub { margin-top:4px; color:var(--muted); font-size:12px; }
@@ -2612,30 +3460,37 @@ DASHBOARD_HTML = r"""<!doctype html>
     .network-controls { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:16px; } .network-controls label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; } select { min-width:280px; padding:9px 10px; border:1px solid #2a4059; border-radius:8px; background:#0b1726; color:var(--text); }
     .filters { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-bottom:12px; }
     input { width:100%; padding:9px 10px; border:1px solid #2a4059; border-radius:8px; background:#0b1726; color:var(--text); outline:none; } input:focus { border-color:var(--cyan); }
+    button { padding:9px 13px; border:1px solid #2a5972; border-radius:8px; background:#102238; color:var(--cyan); cursor:pointer; font:inherit; } button:hover { border-color:var(--cyan); background:#15304a; } button:disabled { opacity:.55; cursor:wait; }
     .topology-board { min-height:0; padding:12px; background:#0b1726; border:1px solid #1c2c40; border-radius:10px; overflow:auto; } .topology-route { display:flex; align-items:center; gap:9px; margin-bottom:12px; color:#79a3c7; font-size:18px; } .topology-chip { min-width:150px; padding:7px 10px; border:1px solid #2a3b51; border-radius:7px; background:#102238; color:var(--text); font-size:12px; } .topology-chip.computer { border-color:var(--cyan); } .topology-chip.gateway { border-color:var(--yellow); } .topology-chip.internet { border-color:var(--green); } .topology-chip .muted { display:block; margin-top:2px; } .topology-table { min-width:720px; } .topology-table th, .topology-table td { padding:7px 8px; } .topology-table tr.stale { opacity:.62; } .topology-empty { color:var(--muted); border:1px dashed #2a3b51; border-radius:8px; padding:10px; }
     .machine-map { background:#0b1726; border:1px solid #1c2c40; border-radius:10px; overflow:auto; } .machine-map svg { display:block; width:100%; min-width:760px; height:auto; } .machine-map-link { stroke:#35506b; stroke-width:1.5; opacity:.85; } .machine-map-node rect { fill:#102238; stroke:#2a3b51; stroke-width:1.2; } .machine-map-node.computer rect { stroke:var(--cyan); } .machine-map-node.gateway rect { stroke:var(--yellow); } .machine-map-node.internet rect { stroke:var(--green); } .machine-map-node.device rect { stroke:#5aa6d6; } .machine-map-node.stale { opacity:.62; } .machine-map-globe { fill:none; stroke:var(--green); stroke-width:1.4; } .machine-map-title { fill:var(--text); font-size:12px; font-weight:600; } .machine-map-secondary { fill:var(--cyan); font-size:11px; } .machine-map-detail { fill:var(--muted); font-size:10px; } .machine-map-empty { color:var(--muted); padding:24px 12px; text-align:center; }
+    .wireless-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; } .wireless-status { margin:-7px 0 10px; } .signal { white-space:nowrap; } .info-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; } .info-item { padding:10px; border:1px solid #1c2c40; border-radius:8px; background:#0b1726; } .info-item .label { font-size:10px; } .info-item .sub { word-break:break-word; }
     .legend { color:var(--muted); font-size:12px; margin-top:8px; }
-    @media (max-width:1000px) { .grid { grid-template-columns:repeat(3,minmax(0,1fr)); } .columns,.charts { grid-template-columns:1fr; } }
-    @media (max-width:620px) { main { padding:16px; } header { display:block; } .badge { display:inline-block; margin-top:12px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .filters { grid-template-columns:1fr; } }
+    @media (max-width:1200px) { .grid { grid-template-columns:repeat(4,minmax(0,1fr)); } .info-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media (max-width:1000px) { .grid { grid-template-columns:repeat(3,minmax(0,1fr)); } .columns,.charts,.wireless-grid { grid-template-columns:1fr; } }
+    @media (max-width:620px) { main { padding:16px; } header { display:block; } .badge { display:inline-block; margin-top:12px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .filters,.info-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
 <main>
   <header><div><h1>RadarScope</h1><p>Vue locale de l’activité autour de cet ordinateur.</p></div><div class="badge" id="updated">Connexion…</div></header>
-  <section class="panel network-controls"><label for="interface-select">Interface à observer</label><select id="interface-select"><option value="all">Toutes les interfaces</option></select><span class="legend" id="network-note">—</span></section>
+  <section class="panel"><h2>Informations de cet ordinateur</h2><div class="info-grid" id="machine-profile"></div></section>
   <section class="grid">
     <article class="card"><div class="label">Charge CPU</div><div class="value" id="cpu">—</div><div class="sub" id="cpu-sub">—</div></article>
     <article class="card"><div class="label">Mémoire</div><div class="value" id="memory">—</div><div class="sub" id="memory-sub">—</div></article>
     <article class="card"><div class="label">Disque /</div><div class="value" id="disk">—</div><div class="sub" id="disk-sub">—</div></article>
     <article class="card"><div class="label">Réseau local</div><div class="value" id="devices">—</div><div class="sub" id="devices-sub">—</div></article>
     <article class="card"><div class="label">Connexions</div><div class="value" id="connections">—</div><div class="sub" id="connections-sub">—</div></article>
+    <article class="card"><div class="label">Wi‑Fi autour</div><div class="value" id="wifi-count">—</div><div class="sub" id="wifi-sub">—</div></article>
+    <article class="card"><div class="label">Bluetooth autour</div><div class="value" id="bluetooth-count">—</div><div class="sub" id="bluetooth-sub">—</div></article>
   </section>
   <section class="panel"><h2>Historique local</h2><div class="charts"><div><div class="sub">Charge CPU</div><canvas class="chart" id="cpu-chart" width="720" height="220"></canvas></div><div><div class="sub">Débit réseau estimé</div><canvas class="chart" id="network-chart" width="720" height="220"></canvas></div></div><div class="legend" id="history-note">—</div></section>
+  <section class="panel network-controls"><label for="interface-select">Interface à observer</label><select id="interface-select"><option value="all">Toutes les interfaces</option></select><span class="legend" id="network-note">—</span></section>
   <section class="panel"><h2>Carte topologique du réseau local</h2><div class="topology-board" id="topology-view" role="img" aria-label="Topologie réseau"></div><div class="legend" id="topology-note">—</div></section>
   <section class="panel"><h2>Machines autour de cet ordinateur</h2><div class="machine-map" id="machine-map-view" role="img" aria-label="Vue graphique compacte des machines découvertes"></div><div class="legend" id="machine-map-note">—</div></section>
+  <section class="panel"><h2>Réseaux et appareils radio autour de l’ordinateur</h2><div class="network-controls"><span class="legend" id="radio-refresh-status">Scan automatique toutes les 30 secondes</span><button id="refresh-radio" type="button">Actualiser Wi‑Fi et Bluetooth</button></div><div class="wireless-grid"><div><h2>Autres réseaux Wi‑Fi</h2><div class="sub wireless-status" id="wifi-note">—</div><div class="scroll" id="wifi-table"></div></div><div><h2>Autres appareils Bluetooth</h2><div class="sub wireless-status" id="bluetooth-note">—</div><div class="scroll" id="bluetooth-table"></div></div></div></section>
   <div class="columns">
     <div>
-      <section class="panel"><h2>Appareils visibles par ARP</h2><div class="scroll" id="devices-table"></div></section>
+      <section class="panel"><h2>Machines découvertes</h2><div class="scroll" id="devices-table"></div></section>
       <section class="panel"><h2>Interfaces réseau</h2><div class="scroll" id="interfaces-table"></div></section>
       <section class="panel"><h2>USB et Bluetooth</h2><div class="scroll" id="peripherals-table"></div></section>
     </div>
@@ -2728,17 +3583,45 @@ function renderMachineMap(topology) {
   view.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Machines connectées ou récemment découvertes"><g>${links}</g>${computer ? nodeSvg(computer, "computer") : ""}${gateway ? nodeSvg(gateway, "gateway") : ""}${internet ? nodeSvg(internet, "internet") : ""}${devices.map(node => nodeSvg(node, "device")).join("")}</svg>`;
   document.getElementById("machine-map-note").textContent = devices.length ? `${devices.length} machine(s) représentée(s) · mise à jour automatique avec les nouvelles découvertes` : "Ordinateur local et passerelle affichés ; aucune autre machine découverte.";
 }
+function renderMachineProfile(system) {
+  const profile = system.hardware || {};
+  const values = [
+    ["Hostname local", system.hostname],
+    ["Modèle", profile.model || profile.model_identifier],
+    ["Puce / processeur", profile.chip],
+    ["Système", profile.os_version],
+    ["Architecture", profile.architecture],
+    ["Noyau", profile.kernel],
+    ["Mémoire installée", profile.memory_bytes == null ? null : bytes(profile.memory_bytes)],
+    ["Interface par défaut", system.default_interface],
+  ];
+  document.getElementById("machine-profile").innerHTML = values.map(item => `<div class="info-item"><div class="label">${esc(item[0])}</div><div class="sub">${esc(item[1] || "indisponible")}</div></div>`).join("");
+}
+function renderWireless(data) {
+  const wifi = data.wifi || {}, bluetooth = data.bluetooth || {}, allNetworks = wifi.networks || [], networks = allNetworks.filter(network => !network.current), allDevices = bluetooth.devices || [], nearbyDevices = bluetooth.nearby_devices || allDevices.filter(device => device.nearby), devices = bluetooth.nearby_scan_available ? nearbyDevices : allDevices.filter(device => device.nearby || device.connected || device.paired);
+  document.getElementById("wifi-count").textContent = networks.length;
+  document.getElementById("wifi-sub").textContent = wifi.available ? (wifi.source || "scan local") : "indisponible";
+  document.getElementById("bluetooth-count").textContent = devices.length;
+  document.getElementById("bluetooth-sub").textContent = bluetooth.available ? (bluetooth.source || "scan local") : "indisponible";
+  document.getElementById("wifi-note").textContent = wifi.available ? `${networks.length} autre(s) réseau(x) · ${wifi.current_ssid ? "réseau courant masqué : " + wifi.current_ssid : wifi.source || "source locale"}` : (wifi.error || "Scan Wi‑Fi indisponible");
+  document.getElementById("bluetooth-note").textContent = bluetooth.nearby_scan_available ? `${devices.length} appareil(s) à proximité · ${bluetooth.source || "source locale"}` : devices.length ? `${devices.length} appareil(s) connu(s) · proximité non confirmée` : (bluetooth.error || "Scan Bluetooth indisponible");
+  document.getElementById("wifi-table").innerHTML = table(["SSID", "BSSID", "Signal", "Canal", "Sécurité"], networks.map(network => `<tr><td>${esc(network.ssid)}</td><td>${esc(network.bssid)}</td><td class="signal ${Number(network.rssi_dbm) > -60 ? "ok" : Number(network.rssi_dbm) > -75 ? "warn" : "muted"}">${esc(network.rssi_dbm == null ? "—" : network.rssi_dbm + " dBm")}</td><td>${esc(network.channel || "—")} <span class="muted">${esc(network.band || "")}</span></td><td>${esc(network.security || "inconnue")}</td></tr>`), "Aucun réseau Wi‑Fi voisin détecté.");
+  document.getElementById("bluetooth-table").innerHTML = table(["Nom", "Adresse", "Signal", "État", "Source"], devices.map(device => `<tr><td>${esc(device.name)}</td><td>${esc(device.address)}</td><td>${esc(device.rssi_dbm == null ? "—" : device.rssi_dbm + " dBm")}</td><td class="${device.nearby || device.connected ? "ok" : "muted"}">${device.nearby ? "à proximité" : device.connected ? "connecté" : device.paired ? "appairé · proximité non confirmée" : "connu"}</td><td>${esc(device.source || "—")}</td></tr>`), "Aucun autre appareil Bluetooth détecté.");
+}
 function renderExtras(data) {
   latestData = data;
   const history = data.history || [], hasNetworkHistory = history.some(item => item.network_rx_bytes != null || item.network_tx_bytes != null), rx = hasNetworkHistory ? networkRates(history, "network_rx_bytes") : [], tx = hasNetworkHistory ? networkRates(history, "network_tx_bytes") : [];
   drawChart("cpu-chart", history.map(item => item.cpu_load), "#65dcff", "");
   drawChart("network-chart", rx.map((value, index) => value + (tx[index] || 0)), "#79e5a0", " MiB/s");
   document.getElementById("history-note").textContent = data.history_enabled ? history.length + " points conservés localement dans SQLite" : "Historique désactivé";
-  renderTopology(data.topology || {}); renderMachineMap(data.topology || {}); renderConnections(data);
+  renderTopology(data.topology || {}); renderMachineMap(data.topology || {}); renderMachineProfile(data.system || {}); renderWireless(data); renderConnections(data);
 }
-const update = async () => {
+const update = async (forceWireless = false) => {
+  const button = document.getElementById("refresh-radio");
+  if (forceWireless) { button.disabled = true; document.getElementById("radio-refresh-status").textContent = "Actualisation Wi‑Fi et Bluetooth…"; }
   try {
-    const data = await fetch(`/api/snapshot?interface=${encodeURIComponent(selectedInterface)}&ts=${Date.now()}`, {cache:"no-store"}).then(response => response.json());
+    const refreshParam = forceWireless ? "&refresh=radio" : "";
+    const data = await fetch(`/api/snapshot?interface=${encodeURIComponent(selectedInterface)}&ts=${Date.now()}${refreshParam}`, {cache:"no-store"}).then(response => response.json());
     renderInterfaceSelector(data);
     const s=data.system, cpu=s.cpu, mem=s.memory, disk=s.disk;
     document.getElementById("updated").textContent=`Actualisé ${new Date().toLocaleTimeString()}`;
@@ -2753,16 +3636,19 @@ const update = async () => {
     document.getElementById("connections").textContent=data.connections.length;
     document.getElementById("connections-sub").textContent=`uptime ${esc(s.uptime_seconds == null ? "n/d" : Math.floor(s.uptime_seconds/3600)+"h")}`;
     document.getElementById("network-note").textContent=data.network && data.network.available ? `Débit estimé · ${data.network.source || "compteurs macOS"} · ${data.network.selected_interface === "all" ? "toutes les interfaces" : data.network.selected_interface}` : "Compteurs réseau indisponibles sur cette machine ou cette interface";
-    document.getElementById("devices-table").innerHTML=table(["Nom connu","IP","MAC","Interface","Dernière vue","État"], data.devices.map(d=>`<tr><td>${esc(d.hostname || "inconnu")}</td><td>${esc(d.ip)}</td><td>${esc(d.mac || "—")}</td><td>${esc(d.interface)}</td><td>${esc(d.last_seen || "—")}</td><td class="${d.reachable?"ok":"warn"}">${d.reachable?"actif":"incomplet"}</td></tr>`), "La table ARP est vide.");
+    document.getElementById("devices-table").innerHTML=table(["Nom connu","IP","MAC","Fabricant","Interface","Source","État"], data.devices.map(d=>`<tr><td>${esc(d.hostname || "inconnu")}<span class="muted">${d.hostname_source ? " · " + esc(d.hostname_source) : ""}</span></td><td>${esc(d.ip)}</td><td>${esc(d.mac || "—")}</td><td>${esc(d.vendor || "—")}</td><td>${esc(d.interface || "—")}</td><td>${esc(Array.isArray(d.source) ? d.source.join(", ") : d.source || "—")}</td><td class="${d.reachable?"ok":"warn"}">${d.reachable?"actif":"incomplet"}${d.latency_ms == null ? "" : " · " + esc(d.latency_ms) + " ms"}</td></tr>`), "Aucune machine détectée.");
     document.getElementById("interfaces-table").innerHTML=table(["Interface","Type","IPv4","État"], s.interfaces.map(i=>`<tr><td>${esc(i.hardware_port || i.name)}</td><td>${esc(i.kind || "réseau")}</td><td>${esc(i.ipv4 || "—")}</td><td class="${i.active?"ok":"muted"}">${i.active?"active":"inactive"}</td></tr>`), "Aucune interface détectée.");
     document.getElementById("connections-table").innerHTML=table(["Processus","Proto","État","Endpoint"], data.connections.map(c=>`<tr><td>${esc(c.command)} <span class="muted">(${esc(c.pid)})</span></td><td>${esc(c.protocol)}</td><td>${esc(c.state || "—")}</td><td>${esc(c.endpoint)}</td></tr>`), "Aucune connexion ou lsof est indisponible.");
     document.getElementById("events-table").innerHTML=table(["Heure","Règle","Message"], data.events.map(e=>`<tr><td>${esc(e.timestamp)}</td><td class="${e.rule && String(e.rule).includes("NEW") ? "alert" : "warn"}">${esc(e.rule)}</td><td>${esc(e.message)}</td></tr>`), "Aucune alerte récente.");
     document.getElementById("peripherals-table").innerHTML=table(["Type","Nom","Fabricant","Adresse / emplacement","État"], (data.peripherals||[]).map(p=>"<tr><td>"+esc(p.kind)+"</td><td>"+esc(p.name)+"</td><td>"+esc(p.manufacturer||"—")+"</td><td>"+esc(p.address||"—")+"</td><td class=\""+(p.connected?"ok":"muted")+"\">"+(p.connected?"détecté":"non connecté")+"</td></tr>"), "Aucun périphérique USB ou Bluetooth détecté.");
     renderExtras(data);
-  } catch (error) { document.getElementById("updated").textContent="Dashboard indisponible"; }
+    if (forceWireless) document.getElementById("radio-refresh-status").textContent = "Wi‑Fi et Bluetooth actualisés";
+  } catch (error) { document.getElementById("updated").textContent="Dashboard indisponible"; if (forceWireless) document.getElementById("radio-refresh-status").textContent = "Actualisation impossible"; }
+  finally { if (forceWireless) button.disabled = false; }
 };
 ["filter-app","filter-port","filter-remote"].forEach(id=>document.getElementById(id).addEventListener("input",()=>latestData&&renderConnections(latestData)));
 document.getElementById("interface-select").addEventListener("change", event=>{selectedInterface=event.target.value;const url=new URL(window.location.href);if(selectedInterface==="all")url.searchParams.delete("interface");else url.searchParams.set("interface",selectedInterface);window.history.replaceState({}, "", url);update();});
+document.getElementById("refresh-radio").addEventListener("click",()=>update(true));
 update(); setInterval(update, 3000);
 </script>
 </body>
@@ -2782,7 +3668,10 @@ def dashboard_handler(runtime: DashboardRuntime) -> type[BaseHTTPRequestHandler]
             elif route == "/api/snapshot":
                 query = parse_qs(parsed_url.query)
                 interface = query.get("interface", ["all"])[0]
-                payload = json.dumps(runtime.response(interface), ensure_ascii=False).encode("utf-8")
+                refresh_wireless = query.get("refresh", [""])[0].lower() in {"radio", "wireless", "1", "true"}
+                payload = json.dumps(
+                    runtime.response(interface, refresh_wireless=refresh_wireless), ensure_ascii=False
+                ).encode("utf-8")
                 content_type = "application/json; charset=utf-8"
             else:
                 self.send_error(404)
@@ -2829,6 +3718,7 @@ def run_dashboard(context: Context, args: argparse.Namespace) -> int:
             args.history_hours,
             args.notify_new_devices,
             args.resolve_hostnames,
+            args.active_discovery,
         )
     except (OSError, sqlite3.Error) as exc:
         raise ValueError(f"impossible d'ouvrir l'historique SQLite : {exc}") from exc
@@ -2873,7 +3763,7 @@ DESCRIPTION
 COMMANDES
     doctor       Vérifie la présence de nmap, arp et tcpdump.
     status       Affiche l'état de l'ordinateur et du réseau local.
-    devices      Affiche les appareils présents dans la table ARP.
+    devices      Affiche les machines découvertes avec hostname et provenance.
     connections  Affiche les connexions et processus locaux.
     snapshot     Exporte un état complet au format JSON.
     dashboard    Lance un tableau de bord web local, actualisé automatiquement.
@@ -2900,8 +3790,10 @@ OPTIONS PRINCIPALES
                                     {DEFAULT_TCPDUMP_BUFFER_KIB} KiB).
     --timing 3|4                    Vitesse Nmap ; T4 convient à un LAN fiable,
                                     T3 reste le choix prudent.
-    --resolve-hostnames              Résout les noms au premier scan avec Nmap (-R),
-                                    puis réutilise le cache enregistré dans l’état.
+    --resolve-hostnames              Résout les noms via ARP, cache macOS, mDNS et DNS
+                                    (actif par défaut pour status/devices/snapshot/dashboard).
+    --no-resolve-hostnames           Désactive la résolution de noms des snapshots locaux.
+    --active-discovery               Complète l’ARP par nmap sur le sous-réseau local.
     --sudo-tcpdump                  Préfixe tcpdump par sudo si les droits sont requis.
     --dry-run                       Affiche les commandes sans les exécuter.
 
@@ -2914,6 +3806,7 @@ OBSERVATION LOCALE
                  --host permet une autre adresse d'écoute, à utiliser avec prudence.
                  --history-file / --history-hours contrôlent SQLite et sa rétention.
                  --notify-new-devices active les notifications macOS opt-in.
+                 Affiche aussi le profil local, les réseaux Wi-Fi et les appareils Bluetooth.
 
 SURVEILLANCE ET HISTORIQUE (watch)
     --state-file PATH               Historique JSON (défaut : radarscope_state.json).
@@ -3065,6 +3958,25 @@ def add_snapshot_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help=f"journal JSONL à afficher (défaut : {DEFAULT_EVENT_LOG})",
     )
+    hostname_group = parser.add_mutually_exclusive_group()
+    hostname_group.add_argument(
+        "--resolve-hostnames",
+        dest="resolve_hostnames",
+        action="store_true",
+        help="résout automatiquement les noms des machines (défaut)",
+    )
+    hostname_group.add_argument(
+        "--no-resolve-hostnames",
+        dest="resolve_hostnames",
+        action="store_false",
+        help="désactive les résolutions de noms",
+    )
+    parser.set_defaults(resolve_hostnames=True)
+    parser.add_argument(
+        "--active-discovery",
+        action="store_true",
+        help="complète l'ARP par une découverte nmap du réseau local",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3088,6 +4000,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(handler=run_status)
 
     devices = subparsers.add_parser("devices", parents=[common_sub], help="affiche les appareils ARP visibles")
+    add_snapshot_arguments(devices)
     devices.set_defaults(handler=run_devices)
 
     connections = subparsers.add_parser(
@@ -3108,7 +4021,6 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--history-interval", type=float, default=DEFAULT_HISTORY_INTERVAL, metavar="SEC", help=f"fréquence de mesure (défaut : {DEFAULT_HISTORY_INTERVAL:g}s)")
     dashboard.add_argument("--history-hours", type=float, default=DEFAULT_HISTORY_HOURS, metavar="HEURES", help=f"rétention des mesures (défaut : {DEFAULT_HISTORY_HOURS:g}h)")
     dashboard.add_argument("--notify-new-devices", action="store_true", help="active les notifications macOS pour les nouveaux appareils")
-    dashboard.add_argument("--resolve-hostnames", action="store_true", help="tente de résoudre les noms DNS des appareils découverts")
     add_snapshot_arguments(dashboard)
     dashboard.set_defaults(handler=run_dashboard)
 

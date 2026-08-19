@@ -16,3 +16,9 @@ radarscope_history.sqlite3*
 *_state.json
 *_events.jsonl
 docs/RadarLAN-HLD-LLD-Mode-Emploi.docx
+
+# Exports et captures potentiellement sensibles générés localement
+*_snapshot.json
+*.log
+*.pcap
+*.pcapng

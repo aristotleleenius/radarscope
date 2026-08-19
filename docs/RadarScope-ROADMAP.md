@@ -1,6 +1,6 @@
 # RadarScope — feuille de route
 
-## Disponible dans la version 2.2
+## Disponible dans la version 3.0
 
 - `status` : état CPU, mémoire, disque, batterie, uptime et interface par défaut.
 - `devices` : appareils visibles dans la table ARP locale.
@@ -12,6 +12,13 @@
 - vue graphique compacte séparée des machines découvertes, reliée à l’ordinateur et à la passerelle ;
 - globe Internet après la passerelle avec l’IP publique observée et mise en cache temporairement ;
 - inventaire USB/Bluetooth via `system_profiler` avec fallback I/O Registry ;
+- résolution hostname multi-sources (`arp -a`, cache macOS, socket, mDNS et outils DNS disponibles) avec cache persistant ;
+- profil matériel et logiciel local sans numéro de série ;
+- scan des réseaux Wi-Fi voisins via `airport -s` avec repli `system_profiler` ;
+- inquiry Bluetooth via `blueutil` avec repli sur les appareils appairés/connus ;
+- actualisation manuelle des scans radio et séparation explicite du Wi-Fi courant, des autres réseaux et des appareils Bluetooth réellement détectés ;
+- filtrage des entrées ARP incomplètes/multicast et des pseudo-hostnames DNS pour garder une carte lisible ;
+- enrichissement optionnel des machines par découverte Nmap locale (`--active-discovery`) : fabricant, état et latence ;
 - liste des interfaces LAN/Wi-Fi, y compris les ports déconnectés ;
 - notifications macOS opt-in pour les nouveaux appareils ;
 - filtres dashboard par application, port et adresse distante ;
@@ -19,7 +26,7 @@
 
 ## Prochaine étape recommandée
 
-### 2.2 — historique et visualisation
+### 3.1 — historique et visualisation
 
 - proposer l’export CSV pour les inventaires et diagnostics.
 
